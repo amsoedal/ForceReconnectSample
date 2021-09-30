@@ -14,7 +14,8 @@ namespace ForceReconnect
         private static DateTimeOffset firstErrorTime = DateTimeOffset.MinValue;
         private static DateTimeOffset previousErrorTime = DateTimeOffset.MinValue;
 
-        private static SemaphoreSlim semaphore = new SemaphoreSlim(initialCount: 1, maxCount: 1);
+        private static SemaphoreSlim reconnectSemaphore = new SemaphoreSlim(initialCount: 1, maxCount: 1);
+        private static SemaphoreSlim initSemaphore = new SemaphoreSlim(initialCount: 1, maxCount: 1);
 
         // In general, let StackExchange.Redis handle most reconnects,
         // so limit the frequency of how often this will actually reconnect.
@@ -24,10 +25,12 @@ namespace ForceReconnect
         // multiplexer seems to not be reconnecting, so re-create the multiplexer
         public static TimeSpan ReconnectErrorThreshold = TimeSpan.FromSeconds(30);
 
-        private static string connectionString = "TODO: CALL InitializeConnectionString() method with connection string";
-        private static Lazy<ConnectionMultiplexer> lazyConnection = CreateConnection();
+        public static TimeSpan RestartConnectionTimeout = TimeSpan.FromSeconds(15);
 
-        public static ConnectionMultiplexer Connection { get { return lazyConnection.Value; } }
+        private static string connectionString = "TODO: CALL InitializeConnectionString() method with connection string";
+        private static ConnectionMultiplexer connection = CreateConnection();
+
+        public static ConnectionMultiplexer Connection { get { return connection; } }
 
         public static void InitializeConnectionString(string cnxString)
         {
@@ -59,7 +62,15 @@ namespace ForceReconnect
                 return;
             }
 
-            semaphore.Wait();
+            try
+            {
+                reconnectSemaphore.Wait(RestartConnectionTimeout);
+            }
+            catch
+            {
+                return;
+            }
+
             try
             {
                 utcNow = DateTimeOffset.UtcNow;
@@ -94,33 +105,66 @@ namespace ForceReconnect
                 firstErrorTime = DateTimeOffset.MinValue;
                 previousErrorTime = DateTimeOffset.MinValue;
 
-                Lazy<ConnectionMultiplexer> oldConnection = lazyConnection;
+                ConnectionMultiplexer oldConnection = connection;
                 CloseConnection(oldConnection);
-                lazyConnection = CreateConnection();
+                connection = null;
+                CreateConnection();
                 Interlocked.Exchange(ref lastReconnectTicks, utcNow.UtcTicks);
             }
             finally
             {
-                semaphore.Release();
+                reconnectSemaphore.Release();
             }
         }
 
-        private static Lazy<ConnectionMultiplexer> CreateConnection()
+        private static ConnectionMultiplexer CreateConnection()
         {
-            return new Lazy<ConnectionMultiplexer>(() => ConnectionMultiplexer.Connect(connectionString));
+            if (connection != null)
+            {
+                // If we already have a good connection, let's re-use it
+                return connection;
+            }
+
+            try
+            {
+                initSemaphore.Wait(RestartConnectionTimeout);
+            }
+            catch
+            {
+                // We failed to enter the semaphore. Connection will either be null, or have a value that was created by another thread.
+                return connection;
+            }
+
+            // We entered the semaphore successfully.
+            try
+            {
+                if (connection != null)
+                {
+                    // Another thread must have finished creating a new connection while we were waiting to enter the semaphore. Let's use it
+                    return connection;
+                }
+
+                // Otherwise, we really need to create a new connection.
+                connection = ConnectionMultiplexer.Connect(connectionString);
+                return connection;
+            }
+            finally
+            {
+                initSemaphore.Release();
+            }
         }
 
-        private static void CloseConnection(Lazy<ConnectionMultiplexer> oldMultiplexer)
+        private static void CloseConnection(ConnectionMultiplexer oldConnection)
         {
-            if (oldMultiplexer != null)
+            if (oldConnection != null)
             {
                 try
                 {
-                    oldMultiplexer.Value.Close();
+                    oldConnection.Close();
                 }
                 catch (Exception)
                 {
-                    // Example error condition: if accessing old.Value causes a connection attempt and that fails.
+                    // Example error condition: if accessing oldConnection causes a connection attempt and that fails.
                 }
             }
         }

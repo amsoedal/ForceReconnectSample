@@ -27,21 +27,17 @@ namespace ForceReconnect
 
         public static TimeSpan RestartConnectionTimeout = TimeSpan.FromSeconds(15);
 
-        private static string connectionString = "TODO: CALL InitializeConnectionString() method with connection string";
+        private static string connectionString = "TODO: Call Initialize() method with connection string";
         private static ConnectionMultiplexer connection;
 
         public static ConnectionMultiplexer Connection { get { return connection; } }
 
-        public static void InitializeConnectionString(string cnxString)
+        public static void Initialize(string cnxString)
         {
             if (string.IsNullOrWhiteSpace(cnxString))
                 throw new ArgumentNullException(nameof(cnxString));
 
             connectionString = cnxString;
-        }
-
-        public static void InitializeConnection()
-        {
             connection = CreateConnection();
         }
 

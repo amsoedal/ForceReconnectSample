@@ -41,6 +41,8 @@ namespace ForceReconnect
             connectionString = cnxString;
         }
 
+        #region ForceReconnect synchronous methods
+
         /// <summary>
         /// Force a new ConnectionMultiplexer to be created.
         /// NOTES:
@@ -69,6 +71,8 @@ namespace ForceReconnect
             }
             catch
             {
+                // If we fail to enter the semaphore, then it is possible that another thread has already done so.
+                // ForceReconnect() can be retried while connectivity problems persist.
                 return;
             }
 
@@ -86,7 +90,9 @@ namespace ForceReconnect
                 }
 
                 if (elapsedSinceLastReconnect < ReconnectMinInterval)
+                {
                     return; // Some other thread made it through the check and the lock, so nothing to do.
+                }
 
                 TimeSpan elapsedSinceFirstError = utcNow - firstErrorTime;
                 TimeSpan elapsedSinceMostRecentError = utcNow - previousErrorTime;
@@ -109,7 +115,7 @@ namespace ForceReconnect
                 ConnectionMultiplexer oldConnection = connection;
                 CloseConnection(oldConnection);
                 connection = null;
-                CreateConnection();
+                connection = CreateConnection();
                 Interlocked.Exchange(ref lastReconnectTicks, utcNow.UtcTicks);
             }
             finally
@@ -117,6 +123,63 @@ namespace ForceReconnect
                 reconnectSemaphore.Release();
             }
         }
+
+        // This method may return null if it fails to acquire the semaphore in time.
+        // Use the return value to update the "connection" field
+        private static ConnectionMultiplexer CreateConnection()
+        {
+            if (connection != null)
+            {
+                // If we already have a good connection, let's re-use it
+                return connection;
+            }
+
+            try
+            {
+                initSemaphore.Wait(RestartConnectionTimeout);
+            }
+            catch
+            {
+                // We failed to enter the semaphore in the given amount of time. Connection will either be null, or have a value that was created by another thread.
+                return connection;
+            }
+
+            // We entered the semaphore successfully.
+            try
+            {
+                if (connection != null)
+                {
+                    // Another thread must have finished creating a new connection while we were waiting to enter the semaphore. Let's use it
+                    return connection;
+                }
+
+                // Otherwise, we really need to create a new connection.
+                return ConnectionMultiplexer.Connect(connectionString);
+            }
+            finally
+            {
+                initSemaphore.Release();
+            }
+        }
+
+        private static void CloseConnection(ConnectionMultiplexer oldConnection)
+        {
+            if (oldConnection != null)
+            {
+                try
+                {
+                    oldConnection.Close();
+                }
+                catch (Exception)
+                {
+                    // Example error condition: if accessing oldConnection causes a connection attempt and that fails.
+                }
+            }
+        }
+
+        #endregion ForceReconnect synchronous methods
+
+        #region ForceReconnect async methods
 
         /// <summary>
         /// Force a new ConnectionMultiplexer to be created.
@@ -146,6 +209,8 @@ namespace ForceReconnect
             }
             catch
             {
+                // If we fail to enter the semaphore, then it is possible that another thread has already done so.
+                // ForceReconnectAsync() can be retried while connectivity problems persist.
                 return;
             }
 
@@ -186,7 +251,7 @@ namespace ForceReconnect
                 ConnectionMultiplexer oldConnection = connection;
                 await CloseConnectionAsync(oldConnection);
                 connection = null;
-                await CreateConnectionAsync();
+                connection = await CreateConnectionAsync();
                 Interlocked.Exchange(ref lastReconnectTicks, utcNow.UtcTicks);
             }
             finally
@@ -195,43 +260,8 @@ namespace ForceReconnect
             }
         }
 
-        private static ConnectionMultiplexer CreateConnection()
-        {
-            if (connection != null)
-            {
-                // If we already have a good connection, let's re-use it
-                return connection;
-            }
-
-            try
-            {
-                initSemaphore.Wait(RestartConnectionTimeout);
-            }
-            catch
-            {
-                // We failed to enter the semaphore in the given amount of time. Connection will either be null, or have a value that was created by another thread.
-                return connection;
-            }
-
-            // We entered the semaphore successfully.
-            try
-            {
-                if (connection != null)
-                {
-                    // Another thread must have finished creating a new connection while we were waiting to enter the semaphore. Let's use it
-                    return connection;
-                }
-
-                // Otherwise, we really need to create a new connection.
-                connection = ConnectionMultiplexer.Connect(connectionString);
-                return connection;
-            }
-            finally
-            {
-                initSemaphore.Release();
-            }
-        }
-
+        // This method may return null if it fails to acquire the semaphore in time.
+        // Use the return value to update the "connection" field
         private static async Task<ConnectionMultiplexer> CreateConnectionAsync()
         {
             if (connection != null)
@@ -260,27 +290,11 @@ namespace ForceReconnect
                 }
 
                 // Otherwise, we really need to create a new connection.
-                connection = await ConnectionMultiplexer.ConnectAsync(connectionString);
-                return connection;
+                return await ConnectionMultiplexer.ConnectAsync(connectionString);
             }
             finally
             {
                 initSemaphore.Release();
-            }
-        }
-
-        private static void CloseConnection(ConnectionMultiplexer oldConnection)
-        {
-            if (oldConnection != null)
-            {
-                try
-                {
-                    oldConnection.Close();
-                }
-                catch (Exception)
-                {
-                    // Example error condition: if accessing oldConnection causes a connection attempt and that fails.
-                }
             }
         }
 
@@ -298,5 +312,7 @@ namespace ForceReconnect
                 }
             }
         }
+
+        #endregion ForceReconnect async methods
     }
 }

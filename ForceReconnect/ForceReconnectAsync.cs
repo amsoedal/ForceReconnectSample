@@ -11,35 +11,42 @@ namespace ForceReconnect
 {
     internal static class RedisForceReconnectAsync
     {
-        private static long lastReconnectTicks = DateTimeOffset.MinValue.UtcTicks;
-        private static DateTimeOffset firstErrorTime = DateTimeOffset.MinValue;
-        private static DateTimeOffset previousErrorTime = DateTimeOffset.MinValue;
+        private static long _lastReconnectTicks = DateTimeOffset.MinValue.UtcTicks;
+        private static DateTimeOffset _firstErrorTime = DateTimeOffset.MinValue;
+        private static DateTimeOffset _previousErrorTime = DateTimeOffset.MinValue;
 
-        private static SemaphoreSlim reconnectSemaphore = new SemaphoreSlim(initialCount: 1, maxCount: 1);
-        private static SemaphoreSlim initSemaphore = new SemaphoreSlim(initialCount: 1, maxCount: 1);
+        private static SemaphoreSlim _reconnectSemaphore = new SemaphoreSlim(initialCount: 1, maxCount: 1);
+        private static SemaphoreSlim _initSemaphore = new SemaphoreSlim(initialCount: 1, maxCount: 1);
+
+        private static string _connectionString = "TODO: Call InitializeAsync() method with connection string";
+        private static ConnectionMultiplexer _connection;
+        private static bool _didInitialize = false;
 
         // In general, let StackExchange.Redis handle most reconnects,
         // so limit the frequency of how often this will actually reconnect.
         public static TimeSpan ReconnectMinInterval = TimeSpan.FromSeconds(60);
 
-        // if errors continue for longer than the below threshold, then the
+        // If errors continue for longer than the below threshold, then the
         // multiplexer seems to not be reconnecting, so re-create the multiplexer
         public static TimeSpan ReconnectErrorThreshold = TimeSpan.FromSeconds(30);
 
         public static TimeSpan RestartConnectionTimeout = TimeSpan.FromSeconds(15);
 
-        private static string connectionString = "TODO: Call InitializeAsync() method with connection string";
-        private static ConnectionMultiplexer connection;
+        public static ConnectionMultiplexer Connection { get { return _connection; } }
 
-        public static ConnectionMultiplexer Connection { get { return connection; } }
-
-        public static async Task InitializeAsync(string cnxString)
+        public static async Task InitializeAsync(string connectionString)
         {
-            if (string.IsNullOrWhiteSpace(cnxString))
-                throw new ArgumentNullException(nameof(cnxString));
+            if (_didInitialize)
+            {
+                throw new InvalidOperationException("Cannot initialize more than once.");
+            }
 
-            connectionString = cnxString;
-            connection = await CreateConnectionAsync();
+            if (string.IsNullOrWhiteSpace(connectionString))
+                throw new ArgumentNullException(nameof(connectionString));
+
+            _connectionString = connectionString;
+            _connection = await CreateConnectionAsync();
+            _didInitialize = true;
         }
 
         /// <summary>
@@ -56,7 +63,7 @@ namespace ForceReconnect
         public static async Task ForceReconnectAsync()
         {
             var utcNow = DateTimeOffset.UtcNow;
-            long previousTicks = Interlocked.Read(ref lastReconnectTicks);
+            long previousTicks = Interlocked.Read(ref _lastReconnectTicks);
             var previousReconnectTime = new DateTimeOffset(previousTicks, TimeSpan.Zero);
             TimeSpan elapsedSinceLastReconnect = utcNow - previousReconnectTime;
 
@@ -68,7 +75,7 @@ namespace ForceReconnect
 
             try
             {
-                await reconnectSemaphore.WaitAsync(RestartConnectionTimeout);
+                await _reconnectSemaphore.WaitAsync(RestartConnectionTimeout);
             }
             catch
             {
@@ -82,44 +89,44 @@ namespace ForceReconnect
                 utcNow = DateTimeOffset.UtcNow;
                 elapsedSinceLastReconnect = utcNow - previousReconnectTime;
 
-                if (firstErrorTime == DateTimeOffset.MinValue)
+                if (_firstErrorTime == DateTimeOffset.MinValue)
                 {
                     // We haven't seen an error since last reconnect, so set initial values.
-                    firstErrorTime = utcNow;
-                    previousErrorTime = utcNow;
+                    _firstErrorTime = utcNow;
+                    _previousErrorTime = utcNow;
                     return;
                 }
 
                 if (elapsedSinceLastReconnect < ReconnectMinInterval)
                     return; // Some other thread made it through the check and the lock, so nothing to do.
 
-                TimeSpan elapsedSinceFirstError = utcNow - firstErrorTime;
-                TimeSpan elapsedSinceMostRecentError = utcNow - previousErrorTime;
+                TimeSpan elapsedSinceFirstError = utcNow - _firstErrorTime;
+                TimeSpan elapsedSinceMostRecentError = utcNow - _previousErrorTime;
 
                 bool shouldReconnect =
                     elapsedSinceFirstError >= ReconnectErrorThreshold // Make sure we gave the multiplexer enough time to reconnect on its own if it could.
                     && elapsedSinceMostRecentError <= ReconnectErrorThreshold; // Make sure we aren't working on stale data (e.g. if there was a gap in errors, don't reconnect yet).
 
                 // Update the previousErrorTime timestamp to be now (e.g. this reconnect request).
-                previousErrorTime = utcNow;
+                _previousErrorTime = utcNow;
 
                 if (!shouldReconnect)
                 {
                     return;
                 }
 
-                firstErrorTime = DateTimeOffset.MinValue;
-                previousErrorTime = DateTimeOffset.MinValue;
+                _firstErrorTime = DateTimeOffset.MinValue;
+                _previousErrorTime = DateTimeOffset.MinValue;
 
-                ConnectionMultiplexer oldConnection = connection;
+                ConnectionMultiplexer oldConnection = _connection;
                 await CloseConnectionAsync(oldConnection);
-                connection = null;
-                connection = await CreateConnectionAsync();
-                Interlocked.Exchange(ref lastReconnectTicks, utcNow.UtcTicks);
+                _connection = null;
+                _connection = await CreateConnectionAsync();
+                Interlocked.Exchange(ref _lastReconnectTicks, utcNow.UtcTicks);
             }
             finally
             {
-                reconnectSemaphore.Release();
+                _reconnectSemaphore.Release();
             }
         }
 
@@ -127,37 +134,37 @@ namespace ForceReconnect
         // Use the return value to update the "connection" field
         private static async Task<ConnectionMultiplexer> CreateConnectionAsync()
         {
-            if (connection != null)
+            if (_connection != null)
             {
                 // If we already have a good connection, let's re-use it
-                return connection;
+                return _connection;
             }
 
             try
             {
-                await initSemaphore.WaitAsync(RestartConnectionTimeout);
+                await _initSemaphore.WaitAsync(RestartConnectionTimeout);
             }
             catch
             {
                 // We failed to enter the semaphore in the given amount of time. Connection will either be null, or have a value that was created by another thread.
-                return connection;
+                return _connection;
             }
 
             // We entered the semaphore successfully.
             try
             {
-                if (connection != null)
+                if (_connection != null)
                 {
                     // Another thread must have finished creating a new connection while we were waiting to enter the semaphore. Let's use it
-                    return connection;
+                    return _connection;
                 }
 
                 // Otherwise, we really need to create a new connection.
-                return await ConnectionMultiplexer.ConnectAsync(connectionString);
+                return await ConnectionMultiplexer.ConnectAsync(_connectionString);
             }
             finally
             {
-                initSemaphore.Release();
+                _initSemaphore.Release();
             }
         }
 
@@ -173,7 +180,7 @@ namespace ForceReconnect
             }
             catch (Exception)
             {
-                // Example error condition: if accessing oldConnection causes a connection attempt and that fails.
+                // Ignore any errors from the oldConnection
             }
         }
     }
